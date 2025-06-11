@@ -3,189 +3,118 @@ pragma solidity ^0.8.17;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
-// Interface WETH mở rộng từ IERC20, có thêm deposit và withdraw để wrap/unwrap ETH
+// Interface mở rộng của WETH
 interface IWETH is IERC20 {
-    function deposit() external payable; // wrap ETH -> WETH
-    function withdraw(uint) external;   // unwrap WETH -> ETH
+    function deposit() external payable;
+    function withdraw(uint256) external;
 }
 
-contract SimpleDex {
-    IERC20 public tokenA;    // Token A trong cặp
-    IERC20 public tokenB;    // Token B trong cặp, có thể là WETH
-    IWETH public WETH;       // Contract WETH để wrap/unwrap ETH
+contract DexContract {
+    IERC20 public token;       // ERC20 token (không phải WETH)
+    IWETH public WETH;         // WETH contract
 
-    uint256 public reserveA; // Dự trữ tokenA trong pool
-    uint256 public reserveB; // Dự trữ tokenB trong pool
+    uint256 public reserveToken;
+    uint256 public reserveWETH;
 
-    uint256 public totalLiquidity;               // Tổng lượng liquidity token mint ra
-    mapping(address => uint256) public liquidity; // Lượng liquidity mỗi provider giữ
+    uint256 public totalLiquidity;
+    mapping(address => uint256) public liquidity;
 
-    // Fee: 0.5% (5 / 1000)
-    uint256 public constant FEE_PERCENT = 5;  
+    uint256 public constant FEE_PERCENT = 5;
     uint256 public constant FEE_DENOMINATOR = 1000;
 
-    // Sự kiện khi thêm liquidity
-    event LiquidityAdded(address indexed provider, uint256 amountA, uint256 amountB, uint256 liquidityMinted);
-    // Sự kiện khi rút liquidity
-    event LiquidityRemoved(address indexed provider, uint256 amountA, uint256 amountB, uint256 liquidityBurned);
-    // Sự kiện swap token
+    event LiquidityAdded(address indexed provider, uint256 amountToken, uint256 amountETH, uint256 liquidityMinted);
+    event LiquidityRemoved(address indexed provider, uint256 amountToken, uint256 amountETH, uint256 liquidityBurned);
     event Swap(address indexed swapper, address tokenIn, uint256 amountIn, address tokenOut, uint256 amountOut);
 
-    // Hàm khởi tạo contract, truyền địa chỉ token A, token B và WETH
-    constructor(address _tokenA, address _tokenB, address _weth) {
-        tokenA = IERC20(_tokenA);
-        tokenB = IERC20(_tokenB);
+    constructor(address _token, address _weth) {
+        token = IERC20(_token);
         WETH = IWETH(_weth);
     }
 
-    // Cập nhật lại dự trữ của token A và B trong contract
     function _updateReserves() internal {
-        reserveA = tokenA.balanceOf(address(this));
-        reserveB = tokenB.balanceOf(address(this));
+        reserveToken = token.balanceOf(address(this));
+        reserveWETH = WETH.balanceOf(address(this));
     }
 
-    // Hàm add liquidity vào pool
-    function addLiquidity(uint256 amountA, uint256 amountB) external returns (uint256 liquidityMinted) {
-        require(amountA > 0 && amountB > 0, "Amounts must be > 0");
+    function addLiquidityETH(uint256 amountToken, uint256 minLiquidity) external payable returns (uint256 liquidityMinted) {
+        require(amountToken > 0 && msg.value > 0, "Invalid amounts");
 
-        // Người dùng chuyển tokenA và tokenB cho contract
-        require(tokenA.transferFrom(msg.sender, address(this), amountA), "Transfer A failed");
-        require(tokenB.transferFrom(msg.sender, address(this), amountB), "Transfer B failed");
+        require(token.transferFrom(msg.sender, address(this), amountToken), "Token transfer failed");
+
+        WETH.deposit{value: msg.value}();
 
         if (totalLiquidity == 0) {
-            // Lần đầu tiên add liquidity thì mint liquidity bằng căn bậc 2 của tích lượng token
-            liquidityMinted = sqrt(amountA * amountB);
-            require(liquidityMinted > 0, "Insufficient liquidity minted");
-            totalLiquidity = liquidityMinted;
-            liquidity[msg.sender] = liquidityMinted;
+            liquidityMinted = sqrt(amountToken * msg.value);
         } else {
-            // Lần tiếp theo mint dựa trên tỉ lệ dự trữ hiện tại
             liquidityMinted = min(
-                (amountA * totalLiquidity) / reserveA,
-                (amountB * totalLiquidity) / reserveB
+                (amountToken * totalLiquidity) / reserveToken,
+                (msg.value * totalLiquidity) / reserveWETH
             );
-            require(liquidityMinted > 0, "Insufficient liquidity minted");
-            liquidity[msg.sender] += liquidityMinted;
-            totalLiquidity += liquidityMinted;
         }
+
+        require(liquidityMinted >= minLiquidity, "Insufficient liquidity minted");
+
+        liquidity[msg.sender] += liquidityMinted;
+        totalLiquidity += liquidityMinted;
 
         _updateReserves();
 
-        emit LiquidityAdded(msg.sender, amountA, amountB, liquidityMinted);
+        emit LiquidityAdded(msg.sender, amountToken, msg.value, liquidityMinted);
     }
 
-    // Rút liquidity, trả tokenA và tokenB tương ứng cho người dùng
-    function removeLiquidity(uint256 liquidityAmount) external returns (uint256 amountA, uint256 amountB) {
-        require(liquidityAmount > 0, "Liquidity must be > 0");
-        require(liquidity[msg.sender] >= liquidityAmount, "Not enough liquidity");
+    function removeLiquidity(uint256 liquidityAmount) external returns (uint256 amountToken, uint256 amountETH) {
+        require(liquidityAmount > 0 && liquidity[msg.sender] >= liquidityAmount, "Invalid liquidity");
 
-        // Tính lượng token trả về theo tỉ lệ liquidity
-        amountA = (liquidityAmount * reserveA) / totalLiquidity;
-        amountB = (liquidityAmount * reserveB) / totalLiquidity;
+        amountToken = (liquidityAmount * reserveToken) / totalLiquidity;
+        uint256 amountWETH = (liquidityAmount * reserveWETH) / totalLiquidity;
 
         liquidity[msg.sender] -= liquidityAmount;
         totalLiquidity -= liquidityAmount;
 
-        require(tokenA.transfer(msg.sender, amountA), "Transfer A failed");
-        require(tokenB.transfer(msg.sender, amountB), "Transfer B failed");
-
-        _updateReserves();
-
-        emit LiquidityRemoved(msg.sender, amountA, amountB, liquidityAmount);
-    }
-
-    // Swap ETH sang token (token không phải ETH)
-    function swapExactETHForToken(uint256 minTokensOut) external payable returns (uint256 tokensOut) {
-        require(address(tokenA) == address(WETH) || address(tokenB) == address(WETH), "WETH not in pair");
-        require(msg.value > 0, "Must send ETH");
-
-        // Wrap ETH thành WETH
-        WETH.deposit{value: msg.value}();
-
-        bool wethIsTokenA = address(tokenA) == address(WETH);
-
-        uint256 reserveIn = wethIsTokenA ? reserveA : reserveB;
-        uint256 reserveOut = wethIsTokenA ? reserveB : reserveA;
-
-        // Tính amountIn với fee
-        uint256 amountInWithFee = msg.value * (FEE_DENOMINATOR - FEE_PERCENT) / FEE_DENOMINATOR;
-
-        // Công thức AMM: x * y = k
-        tokensOut = (amountInWithFee * reserveOut) / (reserveIn + amountInWithFee);
-        require(tokensOut >= minTokensOut, "Insufficient output");
-
-        // Transfer token ra cho người swap
-        if (wethIsTokenA) {
-            require(tokenB.transfer(msg.sender, tokensOut), "Transfer tokenB failed");
-        } else {
-            require(tokenA.transfer(msg.sender, tokensOut), "Transfer tokenA failed");
-        }
-
-        _updateReserves();
-
-        emit Swap(msg.sender, address(WETH), msg.value, wethIsTokenA ? address(tokenB) : address(tokenA), tokensOut);
-    }
-
-    // Swap token sang ETH
-    function swapExactTokenForETH(address inputToken, uint256 amountIn, uint256 minETHOut) external returns (uint256 ethOut) {
-        require(inputToken == address(tokenA) || inputToken == address(tokenB), "Invalid token");
-        require(msg.sender != address(0), "Invalid sender");
-        require(amountIn > 0, "AmountIn > 0");
-
-        bool wethIsTokenA = address(tokenA) == address(WETH);
-        require(address(tokenA) == inputToken || address(tokenB) == inputToken, "Input token not in pair");
-        require(address(tokenA) == address(WETH) || address(tokenB) == address(WETH), "WETH not in pair");
-
-        IERC20 inToken = IERC20(inputToken);
-        IERC20 outToken = wethIsTokenA ? tokenB : tokenA;
-
-        uint256 reserveIn = inputToken == address(tokenA) ? reserveA : reserveB;
-        uint256 reserveOut = inputToken == address(tokenA) ? reserveB : reserveA;
-
-        require(inToken.transferFrom(msg.sender, address(this), amountIn), "Transfer in failed");
-
-        uint256 amountInWithFee = amountIn * (FEE_DENOMINATOR - FEE_PERCENT) / FEE_DENOMINATOR;
-
-        ethOut = (amountInWithFee * reserveOut) / (reserveIn + amountInWithFee);
-        require(ethOut >= minETHOut, "Insufficient ETH out");
-
-        // Rút ETH từ WETH
-        WETH.withdraw(ethOut);
-
-        (bool sent,) = msg.sender.call{value: ethOut}("");
+        require(token.transfer(msg.sender, amountToken), "Token transfer failed");
+        WETH.withdraw(amountWETH);
+        (bool sent, ) = msg.sender.call{value: amountWETH}("");
         require(sent, "ETH transfer failed");
 
         _updateReserves();
 
-        emit Swap(msg.sender, inputToken, amountIn, address(WETH), ethOut);
+        emit LiquidityRemoved(msg.sender, amountToken, amountWETH, liquidityAmount);
     }
 
-    // Swap token sang token (không ETH)
-    function swap(address inputToken, uint256 amountIn, uint256 minOut) external returns (uint256 amountOut) {
-        require(inputToken == address(tokenA) || inputToken == address(tokenB), "Invalid input token");
-        require(amountIn > 0, "AmountIn > 0");
+    function swapExactETHForToken(uint256 minTokensOut) external payable returns (uint256 tokensOut) {
+        require(msg.value > 0, "No ETH sent");
 
-        IERC20 inToken = IERC20(inputToken);
-        IERC20 outToken = inputToken == address(tokenA) ? tokenB : tokenA;
+        WETH.deposit{value: msg.value}();
 
-        uint256 reserveIn = inputToken == address(tokenA) ? reserveA : reserveB;
-        uint256 reserveOut = inputToken == address(tokenA) ? reserveB : reserveA;
+        uint256 amountInWithFee = msg.value * (FEE_DENOMINATOR - FEE_PERCENT) / FEE_DENOMINATOR;
+        tokensOut = (amountInWithFee * reserveToken) / (reserveWETH + amountInWithFee);
+        require(tokensOut >= minTokensOut, "Insufficient output");
 
-        require(inToken.transferFrom(msg.sender, address(this), amountIn), "Transfer in failed");
-
-        uint256 amountInWithFee = amountIn * (FEE_DENOMINATOR - FEE_PERCENT) / FEE_DENOMINATOR;
-
-        amountOut = (amountInWithFee * reserveOut) / (reserveIn + amountInWithFee);
-        require(amountOut >= minOut, "Insufficient output amount");
-
-        require(outToken.transfer(msg.sender, amountOut), "Transfer out failed");
+        require(token.transfer(msg.sender, tokensOut), "Token transfer failed");
 
         _updateReserves();
 
-        emit Swap(msg.sender, inputToken, amountIn, address(outToken), amountOut);
+        emit Swap(msg.sender, address(WETH), msg.value, address(token), tokensOut);
     }
 
-    // Hàm tiện ích tính căn bậc 2 (sqrt)
+    function swapExactTokenForETH(uint256 amountIn, uint256 minETHOut) external returns (uint256 ethOut) {
+        require(amountIn > 0, "No token sent");
+
+        require(token.transferFrom(msg.sender, address(this), amountIn), "Token transfer failed");
+
+        uint256 amountInWithFee = amountIn * (FEE_DENOMINATOR - FEE_PERCENT) / FEE_DENOMINATOR;
+        ethOut = (amountInWithFee * reserveWETH) / (reserveToken + amountInWithFee);
+        require(ethOut >= minETHOut, "Insufficient output");
+
+        WETH.withdraw(ethOut);
+        (bool sent, ) = msg.sender.call{value: ethOut}("");
+        require(sent, "ETH transfer failed");
+
+        _updateReserves();
+
+        emit Swap(msg.sender, address(token), amountIn, address(WETH), ethOut);
+    }
+
     function sqrt(uint y) internal pure returns (uint z) {
         if (y > 3) {
             z = y;
@@ -199,18 +128,10 @@ contract SimpleDex {
         }
     }
 
-    // Hàm tiện ích lấy min trong 2 số
     function min(uint x, uint y) internal pure returns (uint) {
         return x < y ? x : y;
     }
-    event Received(address indexed sender, uint256 value);
-    event FallbackCalled(address indexed sender, uint256 value, bytes data);
-    receive() external payable {
-        emit Received(msg.sender, msg.value);
-    }
 
-    // Gọi sai hàm hoặc gửi ETH có data
-    fallback() external payable {
-        emit FallbackCalled(msg.sender, msg.value, msg.data);
-    }
+    receive() external payable {}
+    fallback() external payable {}
 }
